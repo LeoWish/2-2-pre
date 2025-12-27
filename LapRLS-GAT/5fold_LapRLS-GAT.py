@@ -13,7 +13,10 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
 
-# --- 1. Global Configuration ---
+# =============================================================================
+# 1. GLOBAL CONFIGURATION
+# Ensures reproducibility by fixing seeds for random number generators across libraries.
+# =============================================================================
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -25,12 +28,79 @@ def set_seed(seed=42):
 
 
 set_seed(17)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# --- 2. Early Stopping Utility ---
+# =============================================================================
+# 2. MODEL ARCHITECTURE (Prot-GTN)
+# Prot-GTN: Prior-informed Role-oriented Transformer Graph Training Network.
+# This model uses Transformer-based Graph Convolutions to process microbial
+# interaction graphs, where edges are weighted by prior biological knowledge.
+# =============================================================================
+class ProtGTN(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim=6):
+        super(ProtGTN, self).__init__()
+
+        # --- GRAPH CONVOLUTIONAL BACKBONE ---
+        # TransformerConv applies multi-head attention over the graph.
+        # It treats edge_attr (prior ranks/labels) as a relationship strength indicator.
+        self.conv1 = TransformerConv(input_dim, hidden_dim, heads=4, edge_dim=1, concat=True)
+        self.norm1 = LayerNorm(hidden_dim * 4)  # Adjust for 4 heads concatenation
+
+        self.conv2 = TransformerConv(hidden_dim * 4, hidden_dim, heads=1, edge_dim=1, concat=False)
+        self.norm2 = LayerNorm(hidden_dim)
+
+        # --- DUAL-PATH ADAPTIVE HEADS ---
+        # Fallback MLP: Used when a graph has no edges (e.g., isolated nodes).
+        # It processes raw node features directly after global pooling.
+        self.fallback_mlp = Sequential(
+            Linear(input_dim * 2, hidden_dim),
+            ReLU(),
+            Dropout(0.4),
+            Linear(hidden_dim, 1)
+        )
+
+        # Primary MLP: Processes features extracted by the Graph Convolutional layers.
+        # Input dimension is hidden_dim * 2 because of concatenated Mean and Max pooling.
+        self.mlp = Sequential(
+            Linear(hidden_dim * 2, hidden_dim),
+            ReLU(),
+            Dropout(0.4),
+            Linear(hidden_dim, 1)
+        )
+
+    def forward(self, x, edge_index, edge_attr, batch):
+        # 1. STRUCTURAL VALIDATION
+        # If no edges exist in the batch, skip GNN and use the fallback path
+        # to prevent matrix multiplication errors in convolutional layers.
+        if edge_index.size(1) == 0:
+            # Global Pooling: Concatenate Mean and Max pooling to capture both
+            # average distribution and peak feature signals.
+            x_pool = torch.cat([global_mean_pool(x, batch), global_max_pool(x, batch)], dim=1)
+            return self.fallback_mlp(x_pool).squeeze(1)
+
+        # 2. FEATURE PROPAGATION (GNN Path)
+        # Apply GNN layers with ELU activation and Layer Normalization.
+        h = F.elu(self.conv1(x, edge_index, edge_attr))
+        h = self.norm1(h)
+        h = F.elu(self.conv2(h, edge_index, edge_attr))
+        h = self.norm2(h)
+
+        # 3. GRAPH-LEVEL REPRESENTATION
+        # Aggregate node features into a single graph-level vector.
+        out = torch.cat([global_mean_pool(h, batch), global_max_pool(h, batch)], dim=1)
+
+        # 4. PREDICTION
+        return self.mlp(out).squeeze(1)
+
+
+# =============================================================================
+# 3. UTILITIES & DATA MANAGEMENT
+# =============================================================================
 class EarlyStopping:
-    def __init__(self, patience=10, min_delta=0):
+    """Monitors validation loss to stop training early and prevent overfitting."""
+
+    def __init__(self, patience=15, min_delta=1e-4):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
@@ -42,36 +112,21 @@ class EarlyStopping:
             self.best_loss = val_loss
         elif val_loss > self.best_loss - self.min_delta:
             self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
+            if self.counter >= self.patience: self.early_stop = True
         else:
             self.best_loss = val_loss
             self.counter = 0
 
 
-# --- 3. Data Loading and Preprocessing ---
-dataset_path = 'data/dataset.xlsx'
-xls_path = './dataset/LapRLS_Pre.xlsx'
-
-df = pd.read_excel(dataset_path, sheet_name="Sheet1")
-feature_cols = df.columns[7:]
-
-# Fit scaler on all features once for consistency
-scaler = StandardScaler()
-df[feature_cols] = scaler.fit_transform(df[feature_cols])
-
-try:
-    pred_df = pd.read_excel(xls_path, sheet_name="prediction")
-    gs_df = pd.read_excel(xls_path, sheet_name="gold_standard")
-    gs_dict = dict(zip(gs_df["pair"], gs_df["label"]))
-    min_rank, max_rank = pred_df['rank'].min(), pred_df['rank'].max()
-except FileNotFoundError:
-    gs_dict, pred_df = {}, pd.DataFrame()
-
-
-# --- 4. Optimized Graph Construction ---
-def build_graph_edges(lb_nodes, st_nodes, strain_names, gs_dict, pred_df):
+def build_graph_edges(lb_nodes, st_nodes, strain_names, gs_dict, pred_df, min_rank, max_rank):
+    """
+    Constructs graph edges and assigns weights based on:
+    1. Gold standard labels (if available)
+    2. Normalized prior prediction ranks (0 to 1 scale)
+    """
     edge_list, edge_types = [], []
+
+    # Pre-process prediction dataframe for faster lookup
     if not pred_df.empty and 'Lb' not in pred_df.columns:
         pred_pairs = pred_df['pair'].str.split('&', expand=True)
         pred_pairs.columns = ['Lb', 'St']
@@ -81,9 +136,12 @@ def build_graph_edges(lb_nodes, st_nodes, strain_names, gs_dict, pred_df):
         for st in st_nodes:
             pair_key = f"{lb}&{st}"
             src, dst = strain_names.index(lb), strain_names.index(st)
+
+            # Scenario A: Pair exists in Gold Standard
             if pair_key in gs_dict:
                 edge_list.append((src, dst))
                 edge_types.append([float(gs_dict[pair_key])])
+            # Scenario B: Pair exists in Prior Predictions (Map rank to a [0,1] score)
             elif not pred_df.empty:
                 row_p = pred_df[(pred_df['Lb'] == lb) & (pred_df['St'] == st)]
                 if not row_p.empty:
@@ -92,6 +150,7 @@ def build_graph_edges(lb_nodes, st_nodes, strain_names, gs_dict, pred_df):
                     edge_list.append((src, dst))
                     edge_types.append([score])
 
+    # Convert to undirected graph by adding reverse edges
     edge_list += [(dst, src) for src, dst in edge_list]
     edge_types += edge_types
 
@@ -100,145 +159,141 @@ def build_graph_edges(lb_nodes, st_nodes, strain_names, gs_dict, pred_df):
     return torch.tensor(edge_list, dtype=torch.long).T, torch.tensor(edge_types, dtype=torch.float)
 
 
-all_graphs = []
-for idx, row in df.iterrows():
-    strain_names = [row["Lb1"], row["Lb2"], row["St1"], row["St2"]]
-    raw_features = row[feature_cols].values.astype(float)
+# =============================================================================
+# 4. MAIN PIPELINE
+# =============================================================================
+def main():
+    # --- DATA PREPARATION ---
+    # Load and standardize node features
+    df = pd.read_excel('data/dataset.xlsx', sheet_name="Sheet1")
+    feature_cols = df.columns[7:]
+    scaler = StandardScaler()
+    df[feature_cols] = scaler.fit_transform(df[feature_cols])
 
-    # OPTIMIZATION: Node Role Encoding (Lb=0, St=1) to help model differentiate roles
-    x = []
-    for i in range(4):
-        role_bit = 0.0 if i < 2 else 1.0
-        x.append(np.append(raw_features, [role_bit]))
+    # --- PRIOR KNOWLEDGE INTEGRATION ---
+    try:
+        xls_path = './dataset/LapRLS_Pre.xlsx'
+        pred_df = pd.read_excel(xls_path, sheet_name="prediction")
+        gs_df = pd.read_excel(xls_path, sheet_name="gold_standard")
+        gs_dict = dict(zip(gs_df["pair"], gs_df["label"]))
+        min_rank, max_rank = pred_df['rank'].min(), pred_df['rank'].max()
+    except:
+        # Fallback if prior files are missing
+        gs_dict, pred_df, min_rank, max_rank = {}, pd.DataFrame(), 0, 0
 
-    x = torch.tensor(np.array(x), dtype=torch.float)
-    y = torch.tensor([row["Label"]], dtype=torch.float)
+    # --- GRAPH CONSTRUCTIONS ---
+    all_graphs = []
+    for idx, row in df.iterrows():
+        strains = [row["Lb1"], row["Lb2"], row["St1"], row["St2"]]
+        raw_feat = row[feature_cols].values.astype(float)
 
-    lb_nodes, st_nodes = strain_names[:2], strain_names[2:]
-    edge_index, edge_attr = build_graph_edges(lb_nodes, st_nodes, strain_names, gs_dict, pred_df)
+        # Node Role Encoding: Lb nodes assigned 0.0, St nodes assigned 1.0.
+        # This helps the model distinguish species types in the interaction network.
+        x = torch.tensor([np.append(raw_feat, [0.0 if i < 2 else 1.0]) for i in range(4)], dtype=torch.float)
 
-    all_graphs.append(Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y, sample_id=idx))
+        e_idx, e_attr = build_graph_edges(strains[:2], strains[2:], strains, gs_dict, pred_df, min_rank, max_rank)
+        all_graphs.append(
+            Data(x=x, edge_index=e_idx, edge_attr=e_attr, y=torch.tensor([row["Label"]], dtype=torch.float),
+                 sample_id=idx))  # sample_id stores the original row index
 
+    # --- EVALUATION: 5-FOLD CROSS-VALIDATION ---
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    labels = [int(g.y.item()) for g in all_graphs]
 
-# --- 5. Improved Model Architecture (Transformer-based GNN) ---
-class OptimizedGNN(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim=64):
-        super().__init__()
-        # Using TransformerConv for better multi-head attention over edge attributes
-        self.conv1 = TransformerConv(input_dim, hidden_dim, heads=4, edge_dim=1, concat=True)
-        self.norm1 = LayerNorm(hidden_dim * 4)
-        self.conv2 = TransformerConv(hidden_dim * 4, hidden_dim, heads=1, edge_dim=1, concat=False)
-        self.norm2 = LayerNorm(hidden_dim)
+    fold_auroc, fold_aupr = [], []
+    all_fold_results = []  # Collect complete results for all samples across folds
 
-        # Post-pooling MLP with Skip Connection from raw feature aggregation
-        self.mlp = Sequential(
-            Linear(hidden_dim * 2, hidden_dim),  # Combining Mean and Max pooling
-            ReLU(),
-            Dropout(0.4),
-            Linear(hidden_dim, 1)
-        )
+    print(f"Starting Training on {len(all_graphs)} samples...")
 
-    def forward(self, x, edge_index, edge_attr, batch):
-        if edge_index.size(1) == 0:
-            # Fallback for isolated graphs
-            x_pool = torch.cat([global_mean_pool(x, batch), global_max_pool(x, batch)], dim=1)
-            return self.mlp(x_pool).squeeze(1)
+    for fold, (t_idx, v_idx) in enumerate(skf.split(all_graphs, labels), 1):
+        t_loader = DataLoader([all_graphs[i] for i in t_idx], batch_size=8, shuffle=True)
+        v_loader = DataLoader([all_graphs[i] for i in v_idx], batch_size=8, shuffle=False)
 
-        # Graph Convolutional layers
-        h1 = F.elu(self.conv1(x, edge_index, edge_attr))
-        h1 = self.norm1(h1)
-        h2 = F.elu(self.conv2(h1, edge_index, edge_attr))
-        h2 = self.norm2(h2)
+        model = ProtGTN(input_dim=len(feature_cols) + 1).to(DEVICE)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        early_stopping = EarlyStopping(patience=15)
 
-        # Global Information Aggregation (Mean + Max pooling)
-        out = torch.cat([global_mean_pool(h2, batch), global_max_pool(h2, batch)], dim=1)
-        return self.mlp(out).squeeze(1)
+        pos_c = sum(labels[i] for i in t_idx)
+        pos_w = torch.tensor((len(t_idx) - pos_c) / max(pos_c, 1), dtype=torch.float).to(DEVICE)
+        criterion = BCEWithLogitsLoss(pos_weight=pos_w)
 
+        # --- TRAINING LOOP ---
+        for epoch in range(1, 201):
+            model.train()
+            for data in t_loader:
+                data = data.to(DEVICE)
+                optimizer.zero_grad()
+                out = model(data.x, data.edge_index, data.edge_attr, data.batch)
+                loss = criterion(out, data.y)
+                loss.backward()
+                optimizer.step()
 
-# --- 6. Training and Evaluation Functions ---
-def get_predictions(loader, model):
-    model.eval()
-    all_y, all_scores, all_ids = [], [], []
-    with torch.no_grad():
-        for data in loader:
-            data = data.to(device)
-            out = model(data.x, data.edge_index, data.edge_attr, data.batch)
-            all_y.append(data.y.cpu())
-            all_scores.append(torch.sigmoid(out).cpu())
-            all_ids.append(data.sample_id.cpu())
-    return torch.cat(all_y).numpy(), torch.cat(all_scores).numpy(), torch.cat(all_ids).numpy()
+            # --- VALIDATION LOOP ---
+            model.eval()
+            val_l = 0
+            with torch.no_grad():
+                for data in v_loader:
+                    data = data.to(DEVICE)
+                    v_out = model(data.x, data.edge_index, data.edge_attr, data.batch)
+                    val_l += criterion(v_out, data.y).item()
 
+            scheduler.step(val_l)
+            early_stopping(val_l)
+            if early_stopping.early_stop: break
 
-# --- 7. Execution Loop with Early Stopping & LR Scheduling ---
-all_labels = [int(data.y.item()) for data in all_graphs]
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-detailed_results, fold_metrics = [], []
-
-print(f"Starting Optimized CV Training...")
-
-for fold, (train_idx, val_idx) in enumerate(skf.split(all_graphs, all_labels), 1):
-    train_loader = DataLoader([all_graphs[i] for i in train_idx], batch_size=8, shuffle=True)
-    val_loader = DataLoader([all_graphs[i] for i in val_idx], batch_size=8, shuffle=False)
-
-    model = OptimizedGNN(input_dim=len(feature_cols) + 1).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-4)
-    # OPTIMIZATION: Learning Rate Scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-    early_stopping = EarlyStopping(patience=12)
-
-    num_pos = sum([all_labels[i] for i in train_idx])
-    pos_weight = torch.tensor((len(train_idx) - num_pos) / max(num_pos, 1), dtype=torch.float).to(device)
-    loss_fn = BCEWithLogitsLoss(pos_weight=pos_weight)
-
-    # Extended Epoch range with Early Stopping
-    for epoch in range(1, 150):
-        model.train()
-        total_loss = 0
-        for data in train_loader:
-            data = data.to(device)
-            optimizer.zero_grad()
-            out = model(data.x, data.edge_index, data.edge_attr, data.batch)
-            loss = loss_fn(out, data.y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-        # Validation for Scheduler and Early Stopping
+        # --- EVALUATION (Collect results with fold and sample_index) ---
         model.eval()
-        val_loss = 0
+        y_true_fold, y_score_fold, sample_ids_fold = [], [], []
+
         with torch.no_grad():
-            for data in val_loader:
-                data = data.to(device)
-                v_out = model(data.x, data.edge_index, data.edge_attr, data.batch)
-                val_loss += loss_fn(v_out, data.y).item()
+            for data in v_loader:
+                data = data.to(DEVICE)
+                out = model(data.x, data.edge_index, data.edge_attr, data.batch)
+                y_true_fold.append(data.y.cpu())
+                y_score_fold.append(torch.sigmoid(out).cpu())
+                sample_ids_fold.append(data.sample_id.cpu())  # Original index
 
-        scheduler.step(val_loss)
-        early_stopping(val_loss)
-        if early_stopping.early_stop:
-            break
+        y_true_fold = torch.cat(y_true_fold).numpy()
+        y_score_fold = torch.cat(y_score_fold).numpy()
+        sample_ids_fold = torch.cat(sample_ids_fold).numpy()
 
-    y_true, y_score, ids = get_predictions(val_loader, model)
-    f_auroc, f_aupr = roc_auc_score(y_true, y_score), average_precision_score(y_true, y_score)
-    fold_metrics.append((f_auroc, f_aupr))
+        f_auc = roc_auc_score(y_true_fold, y_score_fold)
+        f_pr = average_precision_score(y_true_fold, y_score_fold)
+        fold_auroc.append(f_auc)
+        fold_aupr.append(f_pr)
 
-    for i in range(len(y_true)):
-        detailed_results.append({
-            'fold': fold, 'sample_index': int(ids[i]),
-            'true_label': int(y_true[i]), 'prediction_score': round(float(y_score[i]), 5)
-        })
-    print(f"Fold {fold:02d} | AUROC: {f_auroc:.4f} | AUPR: {f_aupr:.4f} | Stop Epoch: {epoch}")
+        # Save results for the current fold
+        for i in range(len(y_true_fold)):
+            all_fold_results.append({
+                'fold': fold,
+                'sample_index': int(sample_ids_fold[i]),
+                'true_label': int(y_true_fold[i]),
+                'prediction_score': float(y_score_fold[i])
+            })
 
-# --- 8. Reporting ---
-res_df = pd.DataFrame(detailed_results)
-auroc_vals, aupr_vals = [m[0] for m in fold_metrics], [m[1] for m in fold_metrics]
-pooled_auroc = roc_auc_score(res_df['true_label'], res_df['prediction_score'])
-pooled_aupr = average_precision_score(res_df['true_label'], res_df['prediction_score'])
+        print(f"Fold {fold:02d} | AUROC: {f_auc:.4f} | AUPR: {f_pr:.4f}")
 
-print("\n" + "=" * 50)
-print(f"Mean AUROC: {np.mean(auroc_vals):.3f} (±{np.std(auroc_vals):.3f})")
-print(f"Mean AUPR:  {np.mean(aupr_vals):.3f} (±{np.std(aupr_vals):.3f})")
-print("-" * 50)
-print(f"Pooled CV-AUROC: {pooled_auroc:.5f} | Pooled CV-AUPR: {pooled_aupr:.5f}")
-print("=" * 50)
+    # --- FINAL PERFORMANCE REPORTING ---
+    res_df = pd.DataFrame(all_fold_results)
 
-res_df.to_csv('optimized_cv_predictions.csv', index=False)
+    pooled_auroc = roc_auc_score(res_df['true_label'], res_df['prediction_score'])
+    pooled_aupr = average_precision_score(res_df['true_label'], res_df['prediction_score'])
+
+    print("\n" + "=" * 40)
+    print(f"Mean AUROC: {np.mean(fold_auroc):.3f} (±{np.std(fold_auroc):.3f})")
+    print(f"Mean AUPR: {np.mean(fold_aupr):.3f} (±{np.std(fold_aupr):.3f})")
+    print(f"Final Pooled CV-AUROC: {pooled_auroc:.5f}")
+    print(f"Final Pooled CV-AUPR: {pooled_aupr:.5f}")
+    print("=" * 40)
+
+    res_df = res_df[['fold', 'sample_index', 'true_label', 'prediction_score']]
+    res_df = res_df.sort_values(['fold', 'sample_index']).reset_index(drop=True)
+    res_df['prediction_score'] = res_df['prediction_score'].map('{:.5f}'.format)
+    res_df.to_csv('prot_gtn_cv_results.csv', index=False)
+
+    print("Results saved to 'prot_gtn_cv_results.csv' (prediction_score fixed to 5 decimal places)")
+
+
+if __name__ == "__main__":
+    main()
