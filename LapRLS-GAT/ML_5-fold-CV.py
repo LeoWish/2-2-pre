@@ -26,7 +26,7 @@ def set_seed(seed=42):
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
-set_seed(17)
+set_seed(2)
 
 # --- 2. Data Loading and Preparation ---
 dataset_path = 'data/dataset.xlsx'
@@ -83,7 +83,7 @@ models = {
 }
 
 # --- 4. Cross-Validation Loop ---
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=7)  
 final_summary = []
 all_detailed_predictions = []
 
